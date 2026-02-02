@@ -1,3 +1,3 @@
 #!bin/bash
 
-date
+bc < input.txt | tee log.log
