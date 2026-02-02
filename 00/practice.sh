@@ -1,3 +1,3 @@
 #!bin/bash
 
-bc < input.txt | tee log.log
+ls -a | wc -l | tee log.log
