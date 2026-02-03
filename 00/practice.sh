@@ -1,5 +1,7 @@
 #!/bin/bash
 
-mv "$1" .tmp.file
-mv "$2" "$1"
-mv .tmp.file "$2"
+for person in "$@"
+do
+    echo "Hello $person!"
+done
+
