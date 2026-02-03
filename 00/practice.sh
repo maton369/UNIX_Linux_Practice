@@ -1,3 +1,3 @@
 #!bin/bash
 
-ls -a | wc -l | tee log.log
+rm *.o | tee log.log
