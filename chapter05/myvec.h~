@@ -1,0 +1,1 @@
+int strtvec(char *s, char **v, int max);
