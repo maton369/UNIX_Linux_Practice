@@ -1,0 +1,842 @@
+#define _XOPEN_SOURCE 600   /* grantpt(), posix_openpt(), ptsname(), unlockpt() を有効にするための機能マクロ */
+
+/*
+ * このコードの主題は、
+ *
+ *   「疑似端末 (PTY: pseudo terminal) を自前で作り、
+ *    子プロセスをその疑似端末の slave 側へ接続し、
+ *    親プロセスが master 側を介してユーザ端末と中継する」
+ *
+ * ことである。
+vv *
+ * かなり長いコードだが、本質は
+ *
+ *   1. PTY の master/slave のペアを作る
+ *   2. fork() する
+ *   3. 子は新しいセッションを作り、slave 側を自分の標準入出力へ接続する
+ *   4. 親は master 側を使って、手元の端末との間でデータを双方向転送する
+ *
+ * という流れである。
+ *
+ * これは実質的に、
+ *
+ *   「簡易 terminal emulator / expect 的なもの / ssh や screen, tmux, script などの
+ *    基本構造のごく小さいモデル」
+ *
+ * になっている。
+ *
+ * ============================================================
+ * 疑似端末 (PTY) とは何か
+ * ============================================================
+ *
+ * UNIX / Linux では、通常の対話的プログラムは「端末」にぶら下がって動く。
+ *
+ * たとえば bash, sh, vim, less, top などは、
+ *
+ *   - 標準入力からキー入力を受ける
+ *   - 標準出力へ画面表示する
+ *   - Ctrl+C や Ctrl+Z などの端末由来シグナルの影響を受ける
+ *   - termios 設定や行編集の恩恵を受ける
+ *
+ * といった「端末らしい環境」に依存していることが多い。
+ *
+ * しかし単なる pipe では、
+ *
+ *   - 端末制御
+ *   - ジョブ制御
+ *   - カノニカルモード / raw モード
+ *   - TTY を前提とする対話的挙動
+ *
+ * を十分に再現できない。
+ *
+ * そこで使うのが PTY である。
+ *
+ * PTY は概念的には、
+ *
+ *   master 側  <---->  slave 側
+ *
+ * という 2 つのファイル記述子からなる「仮想端末ペア」である。
+ *
+ * slave 側は、子プロセスから見ると
+ *
+ *   「普通の端末デバイスのように見える」
+ *
+ * 存在である。
+ *
+ * 一方 master 側は、
+ *
+ *   「その slave 側端末を外から操作・監視するための入口」
+ *
+ * である。
+ *
+ * つまりこのコードは、
+ *
+ *   - 子にとっては slave が“自分の端末”
+ *   - 親にとっては master が“その端末を外から覗く窓”
+ *
+ * という構造を作っている。
+ *
+ * 図にすると全体像はこうである。
+ *
+ *   [ユーザの本物の端末]
+ *          ^
+ *          |  read/write
+ *          v
+ *      親プロセス
+ *          ^
+ *          |  read/write
+ *          v
+ *      PTY master  <==== 仮想接続 ====>  PTY slave
+ *                                           ^
+ *                                           | dup2
+ *                                           v
+ *                                       子プロセス
+ *                                       (execvp された対話プログラム)
+ *
+ * つまり親は中継役として動き、
+ * 子は「本物の端末につながっているつもり」で動く。
+ */
+
+#include <sys/types.h>  /* pid_t, fork(), setsid() などの型・宣言 */
+#include <signal.h>     /* kill(), SIGHUP を使うためのヘッダ */
+#include <stdlib.h>     /* exit(), posix_openpt(), grantpt(), unlockpt(), ptsname() を使うためのヘッダ */
+#include <sys/ioctl.h>  /* ioctl(), TIOCSCTTY を使うためのヘッダ */
+#include <sys/select.h> /* select(), FD_SET(), FD_ZERO(), FD_ISSET() を使うためのヘッダ */
+#include <sys/stat.h>   /* open() に関連する定義 */
+#include <fcntl.h>      /* O_RDWR, posix_openpt(), open() を使うためのヘッダ */
+#include <sys/uio.h>    /* read(), write() を使うためのヘッダ */
+#include <termios.h>    /* termios, tcgetattr(), tcsetattr(), raw モード設定用 */
+#include <unistd.h>     /* close(), dup2(), execvp(), fork(), read(), write(), setsid() など */
+
+/*
+ * ptym_open()
+ *
+ * 役割:
+ *   PTY の master 側を開く。
+ *
+ * 疑似端末は通常、
+ *
+ *   1. master 側を開く
+ *   2. その master に対応する slave 側の名前を得る
+ *   3. slave 側を open する
+ *
+ * という流れで作る。
+ *
+ * この関数はそのうちの「master 側を準備する」部分を担う。
+ */
+int ptym_open(void)
+{
+    /*
+     * posix_openpt(O_RDWR)
+     *
+     * POSIX 流儀で PTY master を開く関数である。
+     *
+     * O_RDWR を付けているので、
+     *
+     *   - master 側から読み取り
+     *   - master 側へ書き込み
+     *
+     * の両方ができる。
+     *
+     * 返り値 fd_master は、
+     *
+     *   「この PTY ペアの master 側ファイル記述子」
+     *
+     * である。
+     */
+    int fd_master = posix_openpt(O_RDWR);
+
+    /*
+     * grantpt(fd_master)
+     *
+     * その PTY master に対応する slave 側について、
+     * 適切な所有権・権限を設定する。
+     *
+     * PTY を安全に使うための準備段階であり、
+     * slave 側を後で open できるようにするために必要である。
+     *
+     * 概念的には
+     *
+     *   「この master に対応する slave を使える状態へ整える」
+     *
+     * 操作である。
+     */
+    grantpt(fd_master);
+
+    /*
+     * unlockpt(fd_master)
+     *
+     * その master に対応する slave 側を「unlock」する。
+     *
+     * grantpt() / unlockpt() は PTY 利用時の定型手順であり、
+     * この後 ptsname() で slave 名を得て open できるようになる。
+     *
+     * つまり
+     *
+     *   posix_openpt() -> grantpt() -> unlockpt()
+     *
+     * は PTY master 準備の基本 3 手順である。
+     */
+    unlockpt(fd_master);
+
+    /*
+     * 返すのは master 側 fd。
+     *
+     * この fd を使って後で
+     *
+     *   - 子の slave 側へ届いた出力を読む
+     *   - 子の slave 側へ入力を送る
+     *
+     * ことができる。
+     */
+    return fd_master;
+}
+
+/*
+ * ptys_open(fd_master)
+ *
+ * 役割:
+ *   master 側に対応する slave 側を開く。
+ *
+ * master と slave は 1 対 1 対応している。
+ * master 側から ptsname() を呼ぶと、
+ * 対応する slave デバイスのパス名が得られる。
+ *
+ * その slave を open() したものが、
+ * 子プロセス側で端末として使う fd になる。
+ */
+int ptys_open(int fd_master)
+{
+    /*
+     * ptsname(fd_master)
+     *
+     * master 側に対応する slave デバイス名を返す。
+     *
+     * 典型的には /dev/pts/N のようなパスが返る。
+     *
+     * つまりこれは、
+     *
+     *   「この master の相方である slave はどのデバイス名か？」
+     *
+     * を調べる処理である。
+     *
+     * その名前を open(O_RDWR) して、
+     * slave 側 fd を得ている。
+     */
+    int fd_slave = open(ptsname(fd_master), O_RDWR);
+
+    /*
+     * 返すのは slave 側 fd。
+     *
+     * 子プロセスではこれを STDIN/STDOUT/STDERR に dup2() して、
+     * 自分の端末として使う。
+     */
+    return fd_slave;
+}
+
+/*
+ * set_tty_raw(fd)
+ *
+ * 役割:
+ *   指定 fd の端末設定を raw モード寄りに変更し、
+ *   変更前の termios を返す。
+ *
+ * このコードでは、親の現在の標準入力端末を raw モードへ寄せている。
+ *
+ * なぜ raw にするのか:
+ *
+ *   親プロセスは「ユーザ端末」と「PTY master」の中継を担当する。
+ *   そのとき、手元の本物の端末が通常のカノニカルモードやエコー付きのままだと、
+ *   line editing や Ctrl+C 解釈などが親端末側で先に起きてしまい、
+ *   子へそのまま届けたいバイト列が素直に流れないことがある。
+ *
+ * そこで raw に近い設定へ変え、
+ *
+ *   「ユーザが打ったものをなるべくそのまま PTY master へ流す」
+ *
+ * 形を作っている。
+ *
+ * この関数は old を返すので、
+ * 呼び出し元がそれを別の fd に適用することもできる。
+ */
+struct termios set_tty_raw(int fd)
+{
+    /*
+     * old:
+     *   変更前の元の端末設定を保存する。
+     *
+     * new:
+     *   old を元に raw モード寄りへ変更するための作業用コピー。
+     */
+    struct termios old, new;
+
+    /*
+     * tcgetattr(fd, &old)
+     *
+     * 現在の端末属性を取得する。
+     *
+     * ここでも termios の基本パターンである
+     *
+     *   1. 現在設定を読む
+     *   2. 必要部分だけ変更する
+     *
+     * を使っている。
+     */
+    tcgetattr(fd, &old);
+
+    /*
+     * 編集用コピーを作る。
+     *
+     * いきなりゼロから設定を書くのではなく、
+     * 元設定をベースに不要機能だけ落としている。
+     */
+    new = old;
+
+    /*
+     * c_iflag の調整
+     *
+     * 入力側の前処理をいろいろ無効にしている。
+     *
+     * BRKINT:
+     *   BREAK を SIGINT 的に扱う処理
+     *
+     * ICRNL / INLCR / IGNCR:
+     *   CR/LF 変換関連
+     *
+     * INPCK / ISTRIP:
+     *   パリティや 8bit 処理関連
+     *
+     * IXON:
+     *   Ctrl-S / Ctrl-Q によるソフトフロー制御
+     *
+     * これらを切ることで、
+     *
+     *   「入力バイト列をなるべくそのまま受ける」
+     *
+     * raw 的挙動に近づける。
+     */
+    new.c_iflag &= ~(BRKINT | ICRNL | INLCR | IGNCR | INPCK | ISTRIP | IXON);
+
+    /*
+     * c_oflag の調整
+     *
+     * OPOST を切ることで、
+     *
+     *   出力後処理（たとえば NL -> CRLF 的な変換など）
+     *
+     * を無効化する。
+     *
+     * これにより出力もなるべく素のバイト列に近づく。
+     */
+    new.c_oflag &= ~(OPOST);
+
+    /*
+     * c_lflag の調整
+     *
+     * ECHO / ECHOE / ECHONL:
+     *   入力エコー関連を無効化
+     *
+     * ICANON:
+     *   行単位入力ではなく、文字単位入力へ寄せる
+     *
+     * IEXTEN:
+     *   追加のローカル特殊処理を無効化
+     *
+     * ISIG:
+     *   Ctrl-C / Ctrl-Z などを端末ドライバがシグナルへ変換する機能を無効化
+     *
+     * ここが raw らしさの中心である。
+     *
+     * 特に ISIG を切ることで、
+     * Ctrl-C などが親端末側で SIGINT にならず、
+     * 文字そのものとして中継しやすくなる。
+     */
+    new.c_lflag &= ~(ECHO | ECHOE | ECHONL | ICANON | IEXTEN | ISIG);
+
+    /*
+     * c_cflag の調整
+     *
+     * PARENB:
+     *   パリティ無効化
+     *
+     * CSIZE を落としてから CS8 を立てることで、
+     *
+     *   8bit 文字サイズ
+     *
+     * にする。
+     *
+     * つまり 8bit 透過に近い端末設定を作っている。
+     */
+    new.c_cflag &= ~(PARENB | CSIZE);
+    new.c_cflag |= CS8;
+
+    /*
+     * VMIN / VTIME の設定
+     *
+     * VMIN = 1:
+     *   少なくとも 1 バイト来るまで read は待つ
+     *
+     * VTIME = 0:
+     *   タイムアウトなし
+     *
+     * つまり
+     *
+     *   「1文字来たら返す」
+     *
+     * というシンプルな raw 入力になる。
+     */
+    new.c_cc[VMIN]  = 1;
+    new.c_cc[VTIME] = 0;
+
+    /*
+     * tcsetattr(fd, TCSANOW, &new)
+     *
+     * 変更後の raw モード寄り設定を即時適用する。
+     */
+    tcsetattr(fd, TCSANOW, &new);
+
+    /*
+     * 呼び出し元へ元設定を返す。
+     *
+     * このコードでは後で子の slave 側にも適用しており、
+     * 「親の元々の端末の性質を slave に引き継ぐ」役割も果たしている。
+     */
+    return old;
+}
+
+/*
+ * pty_fork(fd_master)
+ *
+ * 役割:
+ *   PTY を使って「端末付きの子プロセス」を作る。
+ *
+ * この関数は名前の通り、単なる fork() ではなく、
+ * 疑似端末を前提とした fork 準備をまとめて行っている。
+ *
+ * 流れはこうである。
+ *
+ *   1. 親の標準入力 tty を raw 寄りにする
+ *   2. fork() する
+ *   3. 子では setsid() で新セッションを作る
+ *   4. slave 側を open する
+ *   5. slave を controlling terminal にする
+ *   6. slave を標準入出力へ dup2() する
+ *
+ * これにより子は
+ *
+ *   「本物の端末につながっているかのような環境」
+ *
+ * を得る。
+ */
+pid_t pty_fork(int fd_master)
+{
+    int fd_slave;
+    struct termios termios_slave;
+    pid_t pid;
+
+    /*
+     * termios_slave = set_tty_raw(STDIN_FILENO);
+     *
+     * 親の現在の標準入力端末を raw 寄りに変更しつつ、
+     * 変更前の termios を保存している。
+     *
+     * ここは少しトリッキーに見えるが、狙いは次の 2 つである。
+     *
+     *   1. 親の本物の端末からの入力を raw 的に受け、
+     *      中継しやすくする
+     *
+     *   2. 返ってきた old termios を、子の slave 側へ適用して
+     *      子の見える端末属性の初期値として使う
+     *
+     * つまり
+     *
+     *   親の入力側は中継都合で raw にする
+     *   子の仮想端末側は元の端末属性で始める
+     *
+     * という構成になっている。
+     */
+    termios_slave = set_tty_raw(STDIN_FILENO);
+
+    /*
+     * fork() で親子に分岐する。
+     *
+     * 親は子 PID を受け取り、
+     * 子は 0 を受け取る。
+     */
+    pid = fork();
+
+    if (pid == 0) {
+        /*
+         * ここから子プロセス側。
+         *
+         * 子は「新しい端末付きプロセス」として独立させたいので、
+         * まず setsid() を呼ぶ。
+         */
+
+        /*
+         * setsid()
+         *
+         * 新しいセッションを作り、
+         * 子をそのセッションリーダーにする。
+         *
+         * これが重要な理由:
+         *
+         *   controlling terminal（制御端末）を獲得するには、
+         *   そのプロセスがセッションリーダーである必要がある
+         *
+         * からである。
+         *
+         * つまり
+         *
+         *   setsid() をしないと、後の TIOCSCTTY で
+         *   slave 側を制御端末にしにくい
+         *
+         * わけである。
+         *
+         * 図にすると、
+         *
+         *   親のセッションから切り離される
+         *      |
+         *      v
+         *   子が新セッションを持つ
+         *      |
+         *      v
+         *   自分専用の制御端末を持てる準備が整う
+         */
+        setsid();
+
+        /*
+         * slave 側を開く。
+         *
+         * これで子は「自分の端末候補」を得る。
+         */
+        fd_slave = ptys_open(fd_master);
+
+        /*
+         * ioctl(fd_slave, TIOCSCTTY, (char *)0);
+         *
+         * ここでこの slave 側 PTY を、
+         * 子プロセスの controlling terminal（制御端末）にする。
+         *
+         * controlling terminal とは、
+         *
+         *   - そのセッションに対する端末シグナル
+         *   - ジョブ制御
+         *   - TTY としての各種振る舞い
+         *
+         * の基点になる端末である。
+         *
+         * つまりこの ioctl により、
+         *
+         *   「この PTY slave が、子の本物の端末のような存在になる」
+         *
+         * わけである。
+         *
+         * これが疑似端末の核心の 1 つである。
+         *
+         * 単に pipe に dup2() しただけでは、
+         * このような「端末らしさ」は得られない。
+         */
+        ioctl(fd_slave, TIOCSCTTY, (char *)0);
+
+        /*
+         * 子は master 側を使わない。
+         *
+         * master は親が外から覗く側なので、
+         * 子では不要であり閉じる。
+         */
+        close(fd_master);
+
+        /*
+         * tcsetattr(fd_slave, TCSANOW, &termios_slave);
+         *
+         * 子の slave 側へ termios_slave を適用する。
+         *
+         * ここで termios_slave は、親の元の端末属性 old である。
+         *
+         * つまり子から見ると、
+         *
+         *   「自分の端末（slave）は、元々の端末に近い設定で始まる」
+         *
+         * ようにしている。
+         *
+         * 親の本物端末は中継の都合で raw に変えてしまったが、
+         * 子の見える端末まで raw のままだと、
+         * 対話プログラムの期待と違うことがある。
+         *
+         * そこで、子の slave には元の設定を与えて、
+         * 「普通の端末らしさ」を持たせている。
+         */
+        tcsetattr(fd_slave, TCSANOW, &termios_slave);
+
+        /*
+         * dup2(fd_slave, STDIN_FILENO);
+         * dup2(fd_slave, STDOUT_FILENO);
+         * dup2(fd_slave, STDERR_FILENO);
+         *
+         * 子の標準入力・標準出力・標準エラーを、
+         * すべて PTY slave 側へ付け替える。
+         *
+         * これにより子が execvp() 後に動かすプログラムは、
+         *
+         *   stdin  = 端末
+         *   stdout = 端末
+         *   stderr = 端末
+         *
+         * であるかのように見える。
+         *
+         * つまり対話プログラムは、
+         *
+         *   「自分は普通の端末上で動いている」
+         *
+         * と認識しやすくなる。
+         */
+        dup2(fd_slave, STDIN_FILENO);
+        dup2(fd_slave, STDOUT_FILENO);
+        dup2(fd_slave, STDERR_FILENO);
+
+        /*
+         * もし fd_slave が 2 より大きいなら、
+         * もう dup2() 済みなので元の fd は閉じてよい。
+         *
+         * これはファイル記述子リーク防止のための定型処理である。
+         */
+        if (fd_slave > STDERR_FILENO)
+            close(fd_slave);
+
+        /*
+         * 子プロセス側では 0 を返す。
+         *
+         * 呼び出し元 main() はこれを見て、
+         * 自分が子側なら execvp() へ進む。
+         */
+        return 0;
+    } else {
+        /*
+         * 親側では普通の fork() と同様に子 PID を返す。
+         *
+         * 親はこれを保持して、
+         * 後で子を kill() するなどの管理に使う。
+         */
+        return pid;
+    }
+}
+
+/*
+ * loop(rfd1, wfd1, rfd2, wfd2, pid)
+ *
+ * 役割:
+ *   2つの入力元を select() で同時監視し、
+ *   読めた方のデータを対応先へ転送する。
+ *
+ * このコードでは実際には
+ *
+ *   rfd1 = STDIN_FILENO
+ *   wfd1 = fd_master
+ *   rfd2 = fd_master
+ *   wfd2 = STDOUT_FILENO
+ *
+ * で呼ばれている。
+ *
+ * つまり意味としては、
+ *
+ *   - ユーザ端末入力 -> PTY master へ送る
+ *   - PTY master から来た子出力 -> ユーザ端末へ出す
+ *
+ * という双方向中継ループである。
+ *
+ * ここが親プロセスの本体であり、
+ * 実質的には「簡易端末中継器」である。
+ */
+void loop(int rfd1, int wfd1, int rfd2, int wfd2, pid_t pid)
+{
+    int nbytes;
+    char buf[1024];
+    fd_set rfd_set;
+
+    while (1) {
+        /*
+         * 監視集合を初期化する。
+         */
+        FD_ZERO(&rfd_set);
+
+        /*
+         * rfd1 と rfd2 の両方を select 監視対象へ入れる。
+         *
+         * 今回の呼び出しでは
+         *
+         *   rfd1 = ユーザ端末の stdin
+         *   rfd2 = PTY master
+         *
+         * なので、
+         *
+         *   「ユーザが何か打つ」
+         *   「子が何か出力する」
+         *
+         * のどちらも待てる。
+         */
+        FD_SET(rfd1, &rfd_set);
+        FD_SET(rfd2, &rfd_set);
+
+        /*
+         * select()
+         *
+         * どちらかの fd が読み取り可能になるまで待つ。
+         *
+         * これにより busy loop せず、
+         * 入力が来た時だけ反応するイベント駆動型中継になっている。
+         *
+         * maxfd + 1 を第1引数に入れるのは select の約束である。
+         */
+        select((rfd1 > rfd2 ? rfd1 : rfd2) + 1, &rfd_set, NULL, NULL, NULL);
+
+        /*
+         * もし rfd1 側（典型的にはユーザ stdin）に入力が来たら、
+         * それを読んで wfd1 側（典型的には PTY master）へ送る。
+         *
+         * つまり
+         *
+         *   ユーザが打ったキー列 -> 子の端末へ入力
+         *
+         * という流れである。
+         */
+        if (FD_ISSET(rfd1, &rfd_set)) {
+            nbytes = read(rfd1, buf, sizeof(buf));
+
+            /*
+             * nbytes <= 0 なら、
+             * ユーザ側入力元が閉じたかエラーである。
+             *
+             * この場合、子をそのまま残すとぶら下がったままになるので、
+             * SIGHUP を送って終了を促している。
+             *
+             * SIGHUP は「端末切断」を表す伝統的シグナルであり、
+             * 疑似端末でも自然な選択である。
+             */
+            if (nbytes <= 0) {
+                kill(pid, SIGHUP);
+                exit(1);
+            }
+
+            /*
+             * 読んだバイト列をそのまま wfd1 へ書く。
+             *
+             * 今回は PTY master なので、
+             * 子にとっては slave 側から入力が届く形になる。
+             */
+            write(wfd1, buf, nbytes);
+        }
+
+        /*
+         * もし rfd2 側（典型的には PTY master）に出力が来たら、
+         * それを読んで wfd2 側（典型的には親の stdout）へ送る。
+         *
+         * つまり
+         *
+         *   子が端末へ出したもの -> 親経由でユーザの画面へ見せる
+         *
+         * という流れである。
+         */
+        if (FD_ISSET(rfd2, &rfd_set)) {
+            nbytes = read(rfd2, buf, sizeof(buf));
+
+            /*
+             * nbytes <= 0 なら、
+             * PTY master 側から読めなくなった、
+             * すなわち子が終了したか slave 側が閉じた可能性が高い。
+             *
+             * このとき親の中継ループも終わってよい。
+             */
+            if (nbytes <= 0) exit(1);
+
+            /*
+             * 子から届いた出力をそのままユーザ stdout へ流す。
+             */
+            write(wfd2, buf, nbytes);
+        }
+    }
+}
+
+/*
+ * main(argc, argv)
+ *
+ * 役割:
+ *   PTY を作り、子側で指定コマンドを exec し、
+ *   親側で中継ループを回す。
+ *
+ * つまりこのプログラム全体は、
+ *
+ *   「指定したコマンドを、疑似端末付きで起動する」
+ *
+ * ランチャである。
+ *
+ * たとえば
+ *
+ *   ./a.out /bin/sh
+ *
+ * のように呼べば、/bin/sh を PTY slave へ接続して起動し、
+ * 親が master 経由でユーザ端末と仲介する。
+ */
+int main(int argc, char *argv[])
+{
+    /*
+     * master 側を開く。
+     */
+    int fd_master = ptym_open();
+
+    /*
+     * PTY 前提の fork を行う。
+     *
+     * 返り値:
+     *   0   -> 子側
+     *   >0  -> 親側（子 PID）
+     */
+    pid_t pid = pty_fork(fd_master);
+
+    if (pid == 0) {
+        /*
+         * 子側。
+         *
+         * ここに来る時点で、
+         *
+         *   - 新セッション済み
+         *   - slave 側を controlling terminal に設定済み
+         *   - stdin/stdout/stderr が slave 側へ dup2() 済み
+         *
+         * である。
+         *
+         * したがって execvp() されるプログラムは、
+         *
+         *   「自分は普通の端末付き対話プログラム」
+         *
+         * のつもりで動ける。
+         *
+         * argv[1] をコマンド名として、
+         * argv+1 をそのまま引数列として渡しているので、
+         * このラッパ自身の argv[0] を飛ばして子へ引き継ぐ構造である。
+         */
+        execvp(argv[1], argv + 1);
+    } else {
+        /*
+         * 親側。
+         *
+         * 親は master 側 fd を持ち続け、
+         * 自分の端末との間で双方向中継を行う。
+         *
+         * 呼び出しはこう解釈できる。
+         *
+         *   loop(
+         *       STDIN_FILENO,  fd_master,   // ユーザ入力 -> PTY master
+         *       fd_master,     STDOUT_FILENO, // PTY master -> ユーザ画面
+         *       pid
+         *   );
+         *
+         * これにより、
+         *
+         *   ユーザ <-> 親中継 <-> PTY master <-> PTY slave <-> 子
+         *
+         * の経路が完成する。
+         */
+        loop(STDIN_FILENO, fd_master, fd_master, STDOUT_FILENO, pid);
+    }
+}
